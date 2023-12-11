@@ -105,8 +105,8 @@ deploy b plyr@(HumanPlayer pn ud bc) =
 parseDeployCmd :: String -> Either BoardError (TerritoryName, PieceCount)
 parseDeployCmd cmd
     | (terrName, deployCount : []) <- split = do dply <- case readMaybe deployCount :: PieceCount of
-                                                         Nothing -> Left $ TypeError "Invalid deploy argument"
-                                                         Just dp -> Right dp
+                                                              Nothing -> Left $ TypeError "Invalid deploy argument"
+                                                              Just dp -> Right dp
                                                  return (terrName, dply)
     | (_, _ : xs) <- split = Left $ ArityError $ "Too many arguments. What the heck are " ++ $ unwords xs ++ "?"
     | (_ : []) <- split = Left $ ArityError $ "Too few arguments. You need two here."
