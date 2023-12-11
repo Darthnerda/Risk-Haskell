@@ -91,7 +91,10 @@ deploy b plyr@(HumanPlayer pn ud bc) =
     where prompt deployRemaining = 
           do putStrLn $ pn ++ ", you have " ++ deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
              userInput <- getLine
-             case parseDeployCmd userInput of
+             parsed <- return do (terrName, dply) <- parseDeployCmd userInput
+                                 terr <- getTerr b terrName
+                                 return (terr, dply)
+             case parsed of
                   Left err = do putStrLn $ show err
                                 prompt deployRemaining
                   Right (terr, dply) = return (terr, dply)
@@ -99,12 +102,12 @@ deploy b plyr@(HumanPlayer pn ud bc) =
                                                                  newBoard = fromRight b $ replaceTerr b newTerr
                                                                  return (newBoard, plyr)
 
-parseDeployCmd :: String -> Either BoardError (Territory, PieceCount)
+parseDeployCmd :: String -> Either BoardError (TerritoryName, PieceCount)
 parseDeployCmd cmd
-    | (terrName, deployCount : []) <- split = do dply -> case readMaybe deployCount :: PieceCount of
+    | (terrName, deployCount : []) <- split = do dply <- case readMaybe deployCount :: PieceCount of
                                                          Nothing -> Left $ TypeError "Invalid deploy argument"
                                                          Just dp -> Right dp
-                                                 terr -> getTerr 
+                                                 return (terrName, dply)
     | (_, _ : xs) <- split = Left $ ArityError $ "Too many arguments. What the heck are " ++ $ unwords xs ++ "?"
     | (_ : []) <- split = Left $ ArityError $ "Too few arguments. You need two here."
     | [] <- split = Left $ ArityError $ "No arguments at all? What are you crazy? You'll blow up the universe. Try again, bucko."
