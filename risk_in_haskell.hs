@@ -2,6 +2,7 @@ import Data.List
 import Data.Maybe
 import Data.Either
 import Control.Monad
+import Text.Read
 
 -- Type Aliases
 
@@ -52,8 +53,8 @@ data Player = HumanPlayer { playerName :: PlayerName
 
 setup :: Board -> [Player] -> IO (Board, [Player])
 setup board plyrs@(firstPlayer:restPlayers)
-    | terrsLeft = do (Territory a b c d _ f) <- choose board firstPlayer
-                     let updatedTerr = (Territory a b c d (Just $ playerName firstPlayer) f)
+    | terrsLeft = do terr <- choose board firstPlayer
+                     let updatedTerr = terr {owner = (Just $ playerName firstPlayer)}
                          newBoard = fromRight board $ replaceTerr board updatedTerr
                      setup newBoard $ restPlayers ++ [firstPlayer]
     | otherwise = return (board, plyrs)
@@ -65,17 +66,17 @@ play board plyrs@(firstPlayer:restPlayers)
         do putStrLn $ "Congratulations " ++ winnerName ++ ". You won!"
            return (board, plyrs)
     | otherwise = do putStrLn "Uhhhhhhhhh"
-                     (dBoard, dPlayer) <- deploy board firstPlayer
-                     (aBoard, aPlayer) <- attack dBoard dPlayer restPlayers
+                     (dBoard, dPlayer) <- deploy board firstPlayer (unitDeployment firstPlayer)
+                     (aBoard, aPlayer, aRestPlayers) <- attack dBoard dPlayer restPlayers
                      (fBoard, fPlayer) <- fortify aBoard aPlayer
-                     play fBoard restPlayers ++ [fPlayer]
+                     play fBoard $ aRestPlayers ++ [fPlayer]
     where playerHoldings = groupBy (\a b -> owner a == owner b) $ territories board
 
 -- Player Functions
 
 choose :: Board -> Player -> IO Territory
-choose board plyr@(HumanPlayer pn _ _) = 
-    do putStrLn $ pn ++ ", please choose a territory."
+choose board plyr = 
+    do putStrLn $ (playerName plyr) ++ ", please choose a territory."
        terrChoice <- getLine
        case getTerr board terrChoice of
             Left e -> do putStrLn $ show e ++ " Please try again."
@@ -84,39 +85,53 @@ choose board plyr@(HumanPlayer pn _ _) =
                                                                     choose board plyr
             Right t -> return t
 
-deploy :: Board -> Player -> IO (Board, Player)
-deploy b plyr@(HumanPlayer pn ud bc) = 
-    do deploys <- sequence $ whileM (\(terr, dply) -> dply > 0) $ iterateM prompt $ return ()
-       forM deploys (\)
-    where prompt deployRemaining = 
-          do putStrLn $ pn ++ ", you have " ++ deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
-             userInput <- getLine
-             parsed <- return do (terrName, dply) <- parseDeployCmd userInput
-                                 terr <- getTerr b terrName
-                                 return (terr, dply)
-             case parsed of
-                  Left err = do putStrLn $ show err
-                                prompt deployRemaining
-                  Right (terr, dply) = return (terr, dply)
-          deployToBoard ((Territory a b c d e f), dply) -> let newTerr = (Territory a b c d e (f + dply))
-                                                                 newBoard = fromRight b $ replaceTerr b newTerr
-                                                                 return (newBoard, plyr)
+type DeployCmd = (Territory, PieceCount)
 
-parseDeployCmd :: String -> Either BoardError (TerritoryName, PieceCount)
-parseDeployCmd cmd
-    | (terrName, deployCount : []) <- split = do dply <- case readMaybe deployCount :: PieceCount of
-                                                              Nothing -> Left $ TypeError "Invalid deploy argument"
-                                                              Just dp -> Right dp
-                                                 return (terrName, dply)
-    | (_, _ : xs) <- split = Left $ ArityError $ "Too many arguments. What the heck are " ++ $ unwords xs ++ "?"
+deploy :: Board -> Player -> PieceCount -> IO (Board, Player)
+deploy board plyr 0 = return (board, plyr)
+deploy board plyr deployRemaining =
+    do (terr, dply) <- getDeployCmd board plyr deployRemaining
+       let newBoard = deployToBoard board (terr, dply)
+       deploy newBoard plyr (deployRemaining - dply)
+    
+deployToBoard :: Board -> DeployCmd -> Board
+deployToBoard board (terr, dply) = let newTerr = terr { pieceCount = (dply + (pieceCount terr)) }
+                                   in fromRight board $ replaceTerr board newTerr
+
+
+
+getDeployCmd :: Board -> Player -> PieceCount -> IO DeployCmd
+getDeployCmd board plyr@(HumanPlayer pn ud bc) deployRemaining =
+    do putStrLn $ pn ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
+       userInput <- getLine
+       case parseDeployCmd board deployRemaining userInput of
+            Left err -> (do putStrLn $ show err
+                            getDeployCmd board plyr deployRemaining)
+            Right (terr, dply) -> return (terr, dply)
+
+parseDeployCmd :: Board -> PieceCount -> String -> Either BoardError DeployCmd
+parseDeployCmd board deployRemaining cmd
+    | [terrName, deployCount, []] <- split = 
+        do dply <- case readMaybe deployCount :: Maybe PieceCount of
+                        Nothing -> Left $ TypeError "Invalid deploy argument"
+                        Just dp -> Right dp
+           terr <- getTerr board terrName
+           return (terr, dply)
+    | [_, _, xs] <- split = Left $ ArityError $ "Too many arguments. What the heck are " ++ xs ++ "?"
     | (_ : []) <- split = Left $ ArityError $ "Too few arguments. You need two here."
     | [] <- split = Left $ ArityError $ "No arguments at all? What are you crazy? You'll blow up the universe. Try again, bucko."
     where split = words cmd
 
 
--- attack :: Board -> Player -> IO (Either BoardError Board, Player)
+attack :: Board -> Player -> [Player] -> IO (Board, Player, [Player])
+attack b p rp =
+    do putStrLn "We attack!"
+       return (b, p, rp)
 
--- fortify :: Board -> Player -> IO (Either Board, Player)
+fortify :: Board -> Player -> IO (Board, Player)
+fortify b p = 
+    do putStrLn "We fortiy!"
+       return (b, p)
 
 -- Board Build Functions
 
@@ -210,6 +225,7 @@ board = fromRight (Board [] []) $ bulkAdd Nothing
 players = [(HumanPlayer "Josh" 3 []), (HumanPlayer "Nathan" 3 [])]
 
 main = do (setupBoard, setupPlayers) <- setup board players
+          (playedBoard, playedPlayers) <- play setupBoard setupPlayers
           print setupBoard
     
     -- cNames <- Right $ map continentName $ continents board
