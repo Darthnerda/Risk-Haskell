@@ -1,8 +1,10 @@
+{-# LANGUAGE GHC2021 #-}
+
 import Data.List
 import Data.Maybe
 import Data.Either
 import Control.Monad
-import Control.Monad.State
+import qualified Control.Monad.State as ST
 import Text.Read
 import Data.Function
 import System.Random
@@ -53,71 +55,86 @@ data Player = HumanPlayer { playerName :: PlayerName
                           , bonusCards :: [Card] }
 
 -- Game State Monad
-newtype Game = Game { runGame :: (Board, [Player], RandomGen) }
+-- newtype Game = Game { getGame :: (Board, [Player], StdGen) }
+data Game = Game { getBoard :: Board 
+                 , getPlayers :: [Player]
+                 , getRandGen :: StdGen }
+          | NewGame
 
+-- newtype GameOp a = GameOp { runGame :: ST.StateT Game IO a }
+type GameOp a = ST.StateT Game IO a
 
 -- Game Functions
 
-setup :: Board -> [Player] -> IO (Board, [Player])
-setup board plyrs@(firstPlayer:restPlayers)
-    | terrsLeft = do terr <- choose board firstPlayer
-                     let updatedTerr = terr {owner = Just $ playerName firstPlayer}
+setup :: GameOp Board
+setup
+    | terrsLeft = do terr <- choose
+                     game <- ST.get
+                     let updatedTerr = terr {owner = Just $ playerName . head . getPlayers $ game}
                          newBoard = fromRight board $ replaceTerr board updatedTerr
-                     setup newBoard $ restPlayers ++ [firstPlayer]
-    | otherwise = return (board, plyrs)
+                     rotatePlayers
+                     ST.put $ game { getBoard = newBoard }
+                     setup
+    | otherwise = ST.gets getBoard
     where terrsLeft = any (isNothing . owner) $ territories board
+          
 
-play :: Board -> [Player] -> IO (Board, [Player])
-play board plyrs@(firstPlayer:restPlayers)
-    | [(Territory _ _ _ _ (Just winnerName) _):xs] <- playerHoldings =
-        do putStrLn $ "Congratulations " ++ winnerName ++ ". You won!"
-           return (board, plyrs)
-    | otherwise = do putStrLn "Uhhhhhhhhh"
-                     (dBoard, dPlayer) <- deploy board firstPlayer (unitDeployment firstPlayer)
-                     (aBoard, aPlayer, aRestPlayers) <- attack dBoard dPlayer restPlayers
-                     (fBoard, fPlayer) <- fortify aBoard aPlayer
-                     play fBoard $ aRestPlayers ++ [fPlayer]
+play :: GameOp ()
+play
+    | [(Territory _ _ _ _ (Just winnerName) _):_] <- playerHoldings = ST.liftIO $ putStrLn $ "Congratulations " ++ winnerName ++ ". You won!" -- only matches if exactly one player
+    | otherwise = do ST.liftIO $ putStrLn "Time to play!"
+                     currentPlayer <- getCurrentPlayer
+                     deploy $ unitDeployment currentPlayer
+                     attack
+                     fortify
+                     rotatePlayers
+                     play
     where playerHoldings = groupBy (\a b -> owner a == owner b) $ territories board
 
 -- Player Functions
 
-choose :: Board -> Player -> IO Territory
-choose board plyr = 
-    do putStrLn $ playerName plyr ++ ", please choose a territory."
-       terrChoice <- getLine
+choose :: GameOp Territory
+choose = 
+    do game <- ST.get
+       let board = getBoard game
+       currentPlayer <- getCurrentPlayer
+       ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", please choose a territory."
+       terrChoice <- ST.liftIO getLine
        case getTerr board terrChoice of
-            Left e -> do putStrLn $ show e ++ " Please try again."
-                         choose board plyr
-            Right (Territory tn _ _ _ (Just previousOwner) _) -> do putStrLn $ tn ++ " is already owned by " ++ previousOwner ++ ". Please choose a different territory."
-                                                                    choose board plyr
+            Left e -> do ST.liftIO $ putStrLn $ show e ++ " Please try again."
+                         choose
+            Right (Territory tn _ _ _ (Just previousOwner) _) -> do ST.liftIO $ putStrLn $ tn ++ " is already owned by " ++ previousOwner ++ ". Please choose a different territory."
+                                                                    choose
             Right t -> return t
 
 type DeployCmd = (Territory, PieceCount)
 
-deploy :: Board -> Player -> PieceCount -> IO (Board, Player)
-deploy board plyr 0 = return (board, plyr)
-deploy board plyr deployRemaining =
-    do (terr, dply) <- getDeployCmd board plyr deployRemaining
-       let newBoard = deployToBoard board (terr, dply)
-       deploy newBoard plyr (deployRemaining - dply)
+deploy :: PieceCount -> GameOp ()
+deploy 0 = return ()
+deploy deployRemaining =
+    do (terr, dply) <- getDeployCmd deployRemaining
+       deployToBoard (terr, dply)
+       deploy (deployRemaining - dply)
     
-deployToBoard :: Board -> DeployCmd -> Board
-deployToBoard board (terr, dply) = let newTerr = terr { pieceCount = dply + pieceCount terr }
-                                   in fromRight board $ replaceTerr board newTerr
+deployToBoard :: DeployCmd -> GameOp ()
+deployToBoard (terr, dply) = do game <- ST.get
+                                let newTerr = terr { pieceCount = dply + pieceCount terr }
+                                    newBoard = fromRight board $ replaceTerr board newTerr
+                                ST.put $ game { getBoard = newBoard }
 
-
-
-getDeployCmd :: Board -> Player -> PieceCount -> IO DeployCmd
-getDeployCmd board plyr@(HumanPlayer pn ud bc) deployRemaining =
-    do putStrLn $ pn ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
-       userInput <- getLine
-       case parseDeployCmd board plyr deployRemaining userInput of
-            Left err -> (do print err
-                            getDeployCmd board plyr deployRemaining)
+getDeployCmd :: PieceCount -> GameOp DeployCmd
+getDeployCmd deployRemaining =
+    do game <- ST.get
+       let plyr@(HumanPlayer pn ud bc) = head . getPlayers $ game
+       ST.liftIO $ putStrLn $ pn ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
+       userInput <- ST.liftIO getLine
+       case parseDeployCmd plyr deployRemaining userInput of
+            Left err -> (do ST.liftIO $ print err
+                            getDeployCmd deployRemaining)
             Right (terr, dply) -> return (terr, dply)
 
-parseDeployCmd :: Board -> Player -> PieceCount -> String -> Either BoardError DeployCmd
-parseDeployCmd board plyr deployRemaining cmd
+parseDeployCmd :: Player -> PieceCount -> String -> Either BoardError DeployCmd
+parseDeployCmd plyr deployRemaining cmd
     | [terrName, deployCount] <- split = 
         do dply <- case readMaybe deployCount :: Maybe PieceCount of
                         Nothing -> Left $ TypeError "Invalid deploy argument"
@@ -133,15 +150,15 @@ parseDeployCmd board plyr deployRemaining cmd
     where split = words cmd
 
 
-attack :: Board -> Player -> [Player] -> IO (Board, Player, [Player])
-attack b p rp =
-    do putStrLn "We attack!"
-       return (b, p, rp)
+attack :: GameOp ()
+attack =
+    do ST.liftIO $ putStrLn "We attack!"
+       return ()
 
-fortify :: Board -> Player -> IO (Board, Player)
-fortify b p = 
-    do putStrLn "We fortiy!"
-       return (b, p)
+fortify :: GameOp ()
+fortify = 
+    do ST.liftIO $ putStrLn "We fortiy!"
+       return ()
 
 -- Board Build Functions
 
@@ -200,6 +217,15 @@ terrsInCont board contName = if contName `elem` contNames
     else Left $ NoSuchContinent contName
     where contNames = map continentName $ continents board
 
+rotatePlayers :: GameOp ()
+rotatePlayers = do game <- ST.get
+                   let (firstPlayer:restPlayers) = getPlayers game
+                   ST.put $ game {getPlayers = restPlayers ++ [firstPlayer]}
+
+getCurrentPlayer :: GameOp Player
+getCurrentPlayer = do game <- ST.get
+                      return $ head . getPlayers $ game
+
 -- Stats Functions
 
 bonusPerTerr :: Board -> ContinentName -> Either BoardError Float
@@ -223,7 +249,7 @@ whileM :: Monad m => (a -> Bool) -> (a -> m a) -> a -> m ()
 whileM test act init =
    when (test init) $ act init >>= whileM test act
 
-board = fromRight (Board [] []) $ bulkAdd Nothing
+initialBoard = fromRight (Board [] []) $ bulkAdd Nothing
                                           [("Asia", 7), ("North America", 5), ("South America", 2)]
                                           [ ("Kamchatka", ["Alaska"], "Asia", 1)
                                           , ("Alaska", ["Kamchatka", "Alberta"], "North America", 1)
@@ -234,9 +260,15 @@ board = fromRight (Board [] []) $ bulkAdd Nothing
 players = [ HumanPlayer "Josh" 3 []
           , HumanPlayer "Nathan" 3 [] ]
 
-main = do (setupBoard, setupPlayers) <- setup board players
-          (playedBoard, playedPlayers) <- play setupBoard setupPlayers
-          print setupBoard
+-- main = runGame $ ( do { setupBoard <- setup; play; ST.liftIO $ print setupBoard } ) (Game )
+
+main :: IO ()
+main = do gen <- getStdGen
+          endBoard <- ST.evalStateT ( do _ <- setup
+                                         play
+                                         ST.gets getBoard )
+                        $ Game initialBoard players gen
+          print endBoard
     
     -- cNames <- Right $ map continentName $ continents board
     -- scores <- mapM (bonusPerTerr board) cNames
