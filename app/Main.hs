@@ -67,29 +67,36 @@ type GameOp a = ST.StateT Game IO a
 -- Game Functions
 
 setup :: GameOp Board
-setup
-    | terrsLeft = do terr <- choose
-                     game <- ST.get
-                     let updatedTerr = terr {owner = Just $ playerName . head . getPlayers $ game}
-                         newBoard = fromRight board $ replaceTerr board updatedTerr
-                     rotatePlayers
-                     ST.put $ game { getBoard = newBoard }
-                     setup
-    | otherwise = ST.gets getBoard
-    where terrsLeft = any (isNothing . owner) $ territories board
+setup =
+    do  board <- ST.gets getBoard
+        let terrsLeft = any (isNothing . owner) $ territories board
+        if terrsLeft then do
+            terr <- choose
+            currentPlayer <- getCurrentPlayer
+            let updatedTerr = terr {owner = Just $ playerName currentPlayer}
+                newBoard = fromRight board $ replaceTerr board updatedTerr
+            rotatePlayers
+            updateBoard newBoard
+            setup
+        else
+            ST.gets getBoard
           
 
 play :: GameOp ()
-play
-    | [(Territory _ _ _ _ (Just winnerName) _):_] <- playerHoldings = ST.liftIO $ putStrLn $ "Congratulations " ++ winnerName ++ ". You won!" -- only matches if exactly one player
-    | otherwise = do ST.liftIO $ putStrLn "Time to play!"
-                     currentPlayer <- getCurrentPlayer
-                     deploy $ unitDeployment currentPlayer
-                     attack
-                     fortify
-                     rotatePlayers
-                     play
-    where playerHoldings = groupBy (\a b -> owner a == owner b) $ territories board
+play = do
+    board <- ST.gets getBoard
+    let playerHoldings = groupBy (\a b -> owner a == owner b) $ territories board
+    case playerHoldings of
+        [(Territory _ _ _ _ (Just winnerName) _):_] -> ST.liftIO $ putStrLn $ "Congratulations " ++ winnerName ++ ". You won!" -- only matches if exactly one player
+        _ -> do ST.liftIO $ putStrLn "Time to play!"
+                currentPlayer <- getCurrentPlayer
+                deploy $ unitDeployment currentPlayer
+                attack
+                fortify
+                rotatePlayers
+                play
+                                
+        
 
 -- Player Functions
 
@@ -118,6 +125,7 @@ deploy deployRemaining =
     
 deployToBoard :: DeployCmd -> GameOp ()
 deployToBoard (terr, dply) = do game <- ST.get
+                                board <- ST.gets getBoard
                                 let newTerr = terr { pieceCount = dply + pieceCount terr }
                                     newBoard = fromRight board $ replaceTerr board newTerr
                                 ST.put $ game { getBoard = newBoard }
@@ -125,20 +133,27 @@ deployToBoard (terr, dply) = do game <- ST.get
 getDeployCmd :: PieceCount -> GameOp DeployCmd
 getDeployCmd deployRemaining =
     do game <- ST.get
+       board <- ST.gets getBoard
        let plyr@(HumanPlayer pn ud bc) = head . getPlayers $ game
        ST.liftIO $ putStrLn $ pn ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
        userInput <- ST.liftIO getLine
-       case parseDeployCmd plyr deployRemaining userInput of
+       case parseDeployCmd board plyr deployRemaining userInput of
             Left err -> (do ST.liftIO $ print err
                             getDeployCmd deployRemaining)
             Right (terr, dply) -> return (terr, dply)
 
-parseDeployCmd :: Player -> PieceCount -> String -> Either BoardError DeployCmd
-parseDeployCmd plyr deployRemaining cmd
+parseDeployCmd :: Board -> Player -> PieceCount -> String -> Either BoardError DeployCmd
+parseDeployCmd board plyr deployRemaining cmd
     | [terrName, deployCount] <- split = 
         do dply <- case readMaybe deployCount :: Maybe PieceCount of
                         Nothing -> Left $ TypeError "Invalid deploy argument"
                         Just dp -> Right dp
+           if dply < 0 then 
+                Left $ ValueError "You can't deploy a negative amount."
+           else Right ()
+           if dply > deployRemaining then
+                Left $ ValueError "You can't deploy more than your remaining deployment."
+            else Right ()
            terr <- getTerr board terrName
            if playerName plyr == fromJust (owner terr)
               then return ()
@@ -223,8 +238,11 @@ rotatePlayers = do game <- ST.get
                    ST.put $ game {getPlayers = restPlayers ++ [firstPlayer]}
 
 getCurrentPlayer :: GameOp Player
-getCurrentPlayer = do game <- ST.get
-                      return $ head . getPlayers $ game
+getCurrentPlayer = ST.gets (head . getPlayers)
+
+updateBoard :: Board -> GameOp ()
+updateBoard newBoard = do game <- ST.get
+                          ST.put $ game { getBoard = newBoard }
 
 -- Stats Functions
 
