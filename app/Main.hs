@@ -7,7 +7,7 @@ import Data.Maybe
 import Data.Either
 -- import Control.Monad
 import qualified Control.Monad.State as ST
-import Control.Monad.Error
+import Control.Monad.Except
 import Text.Read
 import Data.Function
 import System.Random
@@ -168,6 +168,12 @@ parseDeployCmd board plyr deployRemaining cmd
     | [] <- split = Left $ ArityError "No arguments at all? What are you crazy? You'll blow up the universe. Try again, bucko."
     where split = words cmd
 
+
+-- Ok great so what this test tells me is that I can have a function that can access IO, that uses do notation with monads that don't have IO access. Perfecto.
+test :: (MonadError BoardError m, ST.MonadState Game m, MonadIO m) => m PieceCount
+test = do   cmd <- liftIO getLine
+            (_, _, pcs) <- parseAttackCmd cmd
+            pure pcs
 
 parseDeployCmd2 :: (MonadError BoardError m, ST.MonadState Game m) => String -> PieceCount -> m DeployCmd
 parseDeployCmd2 cmd deployRemaining = 
