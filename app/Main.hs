@@ -1,10 +1,13 @@
 {-# LANGUAGE GHC2021 #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use mapM" #-}
 
 import Data.List
 import Data.Maybe
 import Data.Either
-import Control.Monad
+-- import Control.Monad
 import qualified Control.Monad.State as ST
+import Control.Monad.Error
 import Text.Read
 import Data.Function
 import System.Random
@@ -24,7 +27,10 @@ data Territory = Territory { territoryName :: TerritoryName
                            , continent :: ContinentName
                            , initPieces :: PieceCount
                            , owner :: Maybe PlayerName
-                           , pieceCount :: PieceCount } deriving (Show, Eq)
+                           , pieceCount :: PieceCount } deriving (Eq)
+
+instance Show Territory where
+    show t = territoryName t ++ ", " ++ show (pieceCount t)
 
 data Continent = Continent { continentName :: ContinentName
                            , bonus :: Bonus } deriving Show
@@ -73,10 +79,8 @@ setup =
         if terrsLeft then do
             terr <- choose
             currentPlayer <- getCurrentPlayer
-            let updatedTerr = terr {owner = Just $ playerName currentPlayer}
-                newBoard = fromRight board $ replaceTerr board updatedTerr
+            replaceTerritory terr { owner = Just $ playerName currentPlayer }
             rotatePlayers
-            updateBoard newBoard
             setup
         else
             ST.gets getBoard
@@ -165,10 +169,49 @@ parseDeployCmd board plyr deployRemaining cmd
     where split = words cmd
 
 
+parseDeployCmd2 :: (MonadError BoardError m, ST.MonadState Game m) => String -> PieceCount -> m DeployCmd
+parseDeployCmd2 cmd deployRemaining = 
+    do  let split = words cmd
+        when (length split /= 2) $ throwError $ ArityError "Needs exactly 2 arguments fool."
+        terr <- getTerrST $ head split
+        player <- ST.gets (head . getPlayers)
+        when (playerName player /= fromMaybe "" (owner terr)) $ throwError $ ValueError "That's not your territory! Pick another you fool!"
+        pcs <- readPieceCount $ split !! 1
+        when (pcs < 0) $ throwError $ ValueError "You can't deploy less than 0."
+        when (pcs > deployRemaining) $ throwError $ ValueError "You can't deploy more than youre remaining deployment."
+        pure (terr, pcs)
+
+type AttackCmd = (Territory, Territory, PieceCount)
+
+parseAttackCmd :: (MonadError BoardError m, ST.MonadState Game m) => String -> m AttackCmd
+parseAttackCmd cmd = 
+    do  let split = words cmd
+        when (length split /= 3) $ throwError $ ArityError "Needs exactly 3 arguments fool."
+        sTerr <- getTerrST $ head split
+        dTerr <- getTerrST $ split !! 1
+        ownS <- isOwner sTerr
+        ownD <- isOwner dTerr
+        unless ownS $ throwError $ ValueError "That's not your territory! Pick another you fool!"
+        when ownD $ throwError $ ValueError "You can't attack your own territory. Wait until the fortify step to move units."
+        pcs <- readPieceCount $ split !! 2
+        when (pcs > pieceCount sTerr - 1) $ throwError $ ValueError "You can't attack with more pieces than you have on the territory minus one."
+        when (pcs < 1) $ throwError $ ValueError "You must attack with at least one piece."
+        pure (sTerr, dTerr, pcs)
+
+
+
+
 attack :: GameOp ()
 attack =
-    do ST.liftIO $ putStrLn "We attack!"
-       return ()
+    do  currentPlayer <- getCurrentPlayer
+        playerTerrs <- getPlayerTerrs currentPlayer
+        ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", your territories include: "
+        ST.liftIO $ sequence $ map (putStr . show) playerTerrs
+        ST.liftIO $ putStrLn "During attack phase you have access to the following commands:"
+        ST.liftIO $ putStrLn "board -- shows you the current state of the whole board"
+        ST.liftIO $ putStrLn "player [PLAYERNAME] -- shows you the stats of the given player"
+        ST.liftIO $ putStrLn "attack [SOURCE] [TARGET] [PIECES] -- Attack from source territory to target territoy with that many pieces."
+        return ()
 
 fortify :: GameOp ()
 fortify = 
@@ -226,6 +269,17 @@ getTerr board terrName = case find ((terrName ==) . territoryName) $ territories
     Just terr -> Right terr
     Nothing -> Left $ NoSuchTerritory terrName
 
+getTerrST :: (MonadError BoardError m, ST.MonadState Game m) => TerritoryName -> m Territory
+getTerrST terrName = do terrs <- ST.gets (territories . getBoard)
+                        case find ((terrName ==) . territoryName) terrs of
+                            Just terr -> pure terr
+                            Nothing -> throwError $ NoSuchTerritory terrName
+
+readPieceCount :: (MonadError BoardError m, ST.MonadState Game m) => String -> m PieceCount
+readPieceCount pc = case readMaybe pc of
+                        (Just pcp) -> pure pcp
+                        Nothing -> throwError $ ValueError "Malformed piece count argument."
+
 terrsInCont :: Board -> ContinentName -> Either BoardError [Territory]
 terrsInCont board contName = if contName `elem` contNames
     then Right $ filter ((contName ==) . continent) $ territories board
@@ -240,9 +294,20 @@ rotatePlayers = do game <- ST.get
 getCurrentPlayer :: GameOp Player
 getCurrentPlayer = ST.gets (head . getPlayers)
 
+getCurrentPlayerST :: (MonadError BoardError m, ST.MonadState Game m) => m Player
+getCurrentPlayerST = ST.gets (head . getPlayers)
+
+isOwner :: (MonadError BoardError m, ST.MonadState Game m) => Territory -> m Bool
+isOwner terr = do   player <- getCurrentPlayerST
+                    pure $ playerName player == fromMaybe "" (owner terr)
+
 updateBoard :: Board -> GameOp ()
 updateBoard newBoard = do game <- ST.get
                           ST.put $ game { getBoard = newBoard }
+
+getPlayerTerrs :: Player -> GameOp [Territory]
+getPlayerTerrs plyr = do terrs <- ST.gets (territories . getBoard)
+                         return $ filter ( (== playerName plyr) . fromJust . owner ) terrs
 
 -- Stats Functions
 
@@ -262,6 +327,24 @@ replaceElemAt lst idx newVal = if idx > length lst - 1
                                then Nothing
                                else let (x, _:ys) = splitAt idx lst 
                                     in Just (x ++ newVal : ys)
+
+eitherGuard :: a -> (a ->  Bool) -> e -> Either e a
+eitherGuard x p e = if p x then Right x else Left e
+
+maybeRight :: Either e a -> Maybe a
+maybeRight (Right x) = Just x
+maybeRight (Left _) = Nothing
+
+replaceOn :: (Functor f) => (a -> a -> Bool) -> a -> f a -> f a
+replaceOn p v = fmap (\x -> if p x v then v else x)
+
+replaceTerritory :: Territory -> GameOp ()
+replaceTerritory terr = do game <- ST.get
+                           let  board = getBoard game
+                                terrs = territories board
+                                newTerrs = replaceOn ((==) `on` territoryName) terr terrs
+                           ST.put $ game { getBoard =  board { territories = newTerrs }}
+                           return ()
 
 whileM :: Monad m => (a -> Bool) -> (a -> m a) -> a -> m ()
 whileM test act init =
