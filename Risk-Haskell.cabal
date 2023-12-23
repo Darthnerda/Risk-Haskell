@@ -71,6 +71,7 @@ executable Risk-Haskell
     build-depends:    base >=4.17.2.0
                     , random
                     , mtl
+                    , transformers
 
     -- Directories containing source files.
     hs-source-dirs:   app
