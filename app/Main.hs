@@ -68,7 +68,6 @@ data Player = HumanPlayer { playerName :: PlayerName
 data Game = Game { getBoard :: Board 
                  , getPlayers :: [Player]
                  , getRandGen :: StdGen }
-          | NewGame
 
 -- newtype GameOp a = GameOp { runGame :: ST.StateT Game IO a }
 type GameOp a = ST.StateT Game IO a
@@ -129,18 +128,12 @@ deploy deployRemaining =
        deploy (deployRemaining - dply)
     
 deployToBoard :: (ST.MonadState Game m) => DeployCmd -> m ()
-deployToBoard (terr, dply) = do game <- ST.get
-                                board <- ST.gets getBoard
-                                let newTerr = terr { pieceCount = dply + pieceCount terr }
-                                    newBoard = fromRight board $ replaceTerr board newTerr
-                                ST.put $ game { getBoard = newBoard }
+deployToBoard (terr, dply) = replaceTerrST $ terr { pieceCount = dply + pieceCount terr }
 
 getDeployCmd :: (ST.MonadState Game m, MonadIO m) => PieceCount -> m DeployCmd
 getDeployCmd deployRemaining =
-    do game <- ST.get
-       board <- ST.gets getBoard
-       let plyr@(HumanPlayer pn ud bc) = head . getPlayers $ game
-       ST.liftIO $ putStrLn $ pn ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
+    do currentPlayer <- getCurrentPlayerST
+       ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", you have " ++ show deployRemaining ++ " deployment remaining. Type a territory name and the number of units you would like to deploy there."
        userInput <- ST.liftIO getLine
        result <- runExceptT $ parseDeployCmd userInput deployRemaining
        case result of
@@ -202,8 +195,8 @@ instance Show BattleStats where
 
 battle :: (ST.MonadState Game m) => AttackCmd -> m BattleStats
 battle (sTerr, dTerr, apc) =
-    do  aDice <- fmap sort $ rolls $ clamp (1, 3) apc
-        dDice <- fmap sort $ rolls $ clamp (1, 3) dpc
+    do  aDice <- fmap sortDesc $ withRandGen rolls $ clamp (1, 3) apc
+        dDice <- fmap sortDesc $ withRandGen rolls $ clamp (1, 3) dpc
         let outcomes = zipWith (>) aDice dDice
             (newApc, newDpc) = foldr (\aWon (a,b) -> if aWon then (a, b-1) else (a-1,b)) (apc, dpc) outcomes
             attackerLosses = apc - newApc
@@ -221,22 +214,26 @@ battle (sTerr, dTerr, apc) =
         return $ BattleStats ((aDice, dDice), (attackerLosses, defenderLosses), (pieceCount sTerr - attackerLosses, newDpc), msg)
     where dpc = pieceCount dTerr
 
-rolls :: (ST.MonadState Game m) => Int -> m [Word]
-rolls 0 = return []
-rolls n =
-    do  game <- ST.get
-        g <- ST.gets getRandGen
-        let (r::Word, gg) = uniformR (1, 6) g
-        ST.put game { getRandGen = gg }
-        nxts <- rolls $ n-1
-        return $ r : nxts
+rolls :: RandomGen g => Int -> g -> ([Word], g)
+rolls n g =  let results = take n $ drop 1 $ iterate (\(_, gg) -> uniformR (1, 6) gg) (0, g)
+                 vals = map fst results
+                 lastG = snd $ last results
+            in (vals, lastG)
+
+withRandGen :: (ST.MonadState Game m) => (a -> StdGen -> (b, StdGen)) -> a -> m b
+withRandGen f a =
+    do  gen <- ST.gets getRandGen
+        let (result, newG) = f a gen
+        ST.modify (\game -> game { getRandGen = newG })
+        return result
+
 
 attack :: (ST.MonadState Game m, MonadIO m) => m ()
 attack =
     do  currentPlayer <- getCurrentPlayerST
-        playerTerrs <- ST.gets (filter (\t -> fromMaybe "" (owner t) == playerName currentPlayer) . territories . getBoard)
+        playerTerrs <- getPlayerTerrs currentPlayer
         ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", your territories include: "
-        _ <- ST.liftIO $ sequence $ map (print . territoryName) playerTerrs
+        _ <- ST.liftIO $ sequence $ map print playerTerrs
         ST.liftIO $ putStrLn "You have two commands at your disposal:"
         ST.liftIO $ putStrLn "attack [SOURCE] [TARGET] [PIECES] -- Attack from source territory to target territoy with that many pieces."
         ST.liftIO $ putStrLn "done -- Ends your attack phase."
@@ -248,16 +245,64 @@ attack =
                                 attack
 
 
-fortify :: (ST.MonadIO m) => m ()
+fortify :: (ST.MonadState Game m, MonadIO m) => m ()
 fortify = 
-    do ST.liftIO $ putStrLn "We fortiy!"
-       return ()
+    do  currentPlayer <- getCurrentPlayerST
+        ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", you may now fortify your units. Your territories include: "
+        playerTerrs <- getPlayerTerrs =<< getCurrentPlayerST
+        _ <- ST.liftIO $ sequence $ map print playerTerrs
+        ST.liftIO $ putStrLn "You have two commands at your disposal:"
+        ST.liftIO $ putStrLn "fortiy [SOURCE] [TARGET] [PIECES] -- Move specified number of pieces from source territory to target territory."
+        ST.liftIO $ putStrLn "done -- Ends your fority phase and thus your turn."
+        maybeFrtCmd <- runMaybeT getFortifyCmd
+        case maybeFrtCmd of
+            Nothing -> return ()
+            Just (sTerr, dTerr, pcs) -> do  movePieces sTerr dTerr pcs
+                                            ST.liftIO $ putStrLn $ "Moved " ++ show pcs ++ " pieces from " ++ territoryName sTerr ++ " to " ++ territoryName dTerr ++ "."
+                                            fortify
+        return ()
+
+type FortifyCmd = (Territory, Territory, PieceCount)
+getFortifyCmd :: (ST.MonadState Game m, MonadIO m) => MaybeT m FortifyCmd
+getFortifyCmd =
+    do  ST.liftIO $ putStrLn "Specify a fortify command now (or done to finish fortifying)."
+        cmd <- ST.liftIO getLine
+        guard (cmd /= "done")
+        result <- runExceptT $ parseFortifyCmd cmd
+        case result of
+            Left e -> do    ST.liftIO $ putStr $ show e
+                            ST.liftIO $ putStr " Please try again.\n"
+                            getFortifyCmd
+            Right atkCmd -> return atkCmd
+        
+
+parseFortifyCmd :: (ST.MonadState Game m, MonadError BoardError m) => String -> m FortifyCmd
+parseFortifyCmd cmd =
+    do  let split = words cmd
+        when (length split /= 3) $ throwError $ ArityError "Needs exactly 3 arguments fool!"
+        sTerr <- getTerrST $ head split
+        dTerr <- getTerrST $ split !! 1
+        currentPlayer <- getCurrentPlayerST
+        unless (owner sTerr == Just (playerName currentPlayer)) $ throwError $ ValueError $ "You don't own source territory: " ++ territoryName sTerr ++ "."
+        unless (owner dTerr == Just (playerName currentPlayer)) $ throwError $ ValueError $ "You don't own destination territory: " ++ territoryName sTerr ++ "."
+        pcs <- readPieceCount $ split !! 2
+        when (pcs == pieceCount sTerr) $ throwError $ ValueError "You must leave at least one piece behind."
+        when (pcs > pieceCount sTerr - 1) $ throwError $ ValueError $ "You don't have " ++ show pcs ++ " many pieces at source territory: " ++ territoryName sTerr ++ "."
+        when (pcs <= 0) $ throwError $ ValueError "You can't move a negative number of pieces."
+        return (sTerr, dTerr, pcs)
+
+movePieces :: (ST.MonadState Game m) => Territory -> Territory -> PieceCount -> m ()
+movePieces sTerr dTerr pcs =
+    do  let newSTerr = sTerr { pieceCount = pieceCount sTerr - pcs }
+            newDTerr = dTerr { pieceCount = pieceCount dTerr + pcs }
+        replaceTerrST newSTerr
+        replaceTerrST newDTerr
 
 -- Board Build Functions
 
 insertTerritory :: Board -> TerritoryName -> ContinentName -> PieceCount -> Either BoardError Board
 insertTerritory board@(Board terrs conts) newTName contName initPieces = do
-        getCont board contName -- Just to ensure that the continent exists
+        _ <- getCont board contName -- Just to ensure that the continent exists
         ( let newTerritory = Territory newTName [] contName initPieces Nothing initPieces
           in Right $ Board (newTerritory : terrs) conts )
 
@@ -333,13 +378,8 @@ isOwner :: (MonadError BoardError m, ST.MonadState Game m) => Territory -> m Boo
 isOwner terr = do   player <- getCurrentPlayerST
                     pure $ playerName player == fromMaybe "" (owner terr)
 
-updateBoard :: Board -> GameOp ()
-updateBoard newBoard = do game <- ST.get
-                          ST.put $ game { getBoard = newBoard }
-
-getPlayerTerrs :: Player -> GameOp [Territory]
-getPlayerTerrs plyr = do terrs <- ST.gets (territories . getBoard)
-                         return $ filter ( (== playerName plyr) . fromJust . owner ) terrs
+getPlayerTerrs :: (ST.MonadState Game m) => Player -> m [Territory]
+getPlayerTerrs plyr = ST.gets (filter (\t -> fromMaybe "" (owner t) == playerName plyr) . territories . getBoard)
 
 -- Stats Functions
 
@@ -350,6 +390,9 @@ bonusPerTerr board contName = do
     return $ (fromIntegral $ bonus cont) / (fromIntegral $ length terrs)
 
 -- Utility Functions
+
+sortDesc :: (Ord a) => [a] -> [a]
+sortDesc = sortBy (flip compare)
 
 flatten :: [[a]] -> [a]
 flatten = foldr1 (++)
