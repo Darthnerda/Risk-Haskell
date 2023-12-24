@@ -74,6 +74,22 @@ type GameOp a = ST.StateT Game IO a
 
 -- Game Functions
 
+-- Setup
+
+choose :: (ST.MonadState Game m, MonadIO m) => m Territory
+choose =
+    do game <- ST.get
+       let board = getBoard game
+       currentPlayer <- getCurrentPlayerST
+       ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", please choose a territory."
+       terrChoice <- ST.liftIO getLine
+       case getTerr board terrChoice of
+            Left e -> do ST.liftIO $ putStrLn $ show e ++ " Please try again."
+                         choose
+            Right (Territory tn _ _ _ (Just previousOwner) _) -> do ST.liftIO $ putStrLn $ tn ++ " is already owned by " ++ previousOwner ++ ". Please choose a different territory."
+                                                                    choose
+            Right t -> return t
+
 setup :: (ST.MonadState Game m, MonadIO m) => m Board
 setup =
     do  board <- ST.gets getBoard
@@ -86,6 +102,8 @@ setup =
             setup
         else
             ST.gets getBoard
+
+-- Play
 
 play :: (ST.MonadState Game m, MonadIO m) => m ()
 play = do
@@ -104,19 +122,7 @@ play = do
 
 -- Player Functions
 
-choose :: (ST.MonadState Game m, MonadIO m) => m Territory
-choose =
-    do game <- ST.get
-       let board = getBoard game
-       currentPlayer <- getCurrentPlayerST
-       ST.liftIO $ putStrLn $ playerName currentPlayer ++ ", please choose a territory."
-       terrChoice <- ST.liftIO getLine
-       case getTerr board terrChoice of
-            Left e -> do ST.liftIO $ putStrLn $ show e ++ " Please try again."
-                         choose
-            Right (Territory tn _ _ _ (Just previousOwner) _) -> do ST.liftIO $ putStrLn $ tn ++ " is already owned by " ++ previousOwner ++ ". Please choose a different territory."
-                                                                    choose
-            Right t -> return t
+-- Deploy
 
 type DeployCmd = (Territory, PieceCount)
 
@@ -152,6 +158,8 @@ parseDeployCmd cmd deployRemaining =
         when (pcs < 0) $ throwError $ ValueError "You can't deploy less than 0."
         when (pcs > deployRemaining) $ throwError $ ValueError "You can't deploy more than youre remaining deployment."
         pure (terr, pcs)
+
+-- Attack
 
 type AttackCmd = (Territory, Territory, PieceCount)
 
@@ -210,22 +218,9 @@ battle (sTerr, dTerr, apc) =
                 else -- Attacker and defender take losses
                     do  replaceTerrST dTerr { pieceCount = newDpc }
                         replaceTerrST sTerr { pieceCount = pieceCount sTerr - attackerLosses }
-                        return "Defender successfully defended."
+                        return $ "Defender successfully defended" ++ territoryName dTerr ++ "."
         return $ BattleStats ((aDice, dDice), (attackerLosses, defenderLosses), (pieceCount sTerr - attackerLosses, newDpc), msg)
     where dpc = pieceCount dTerr
-
-rolls :: RandomGen g => Int -> g -> ([Word], g)
-rolls n g =  let results = take n $ drop 1 $ iterate (\(_, gg) -> uniformR (1, 6) gg) (0, g)
-                 vals = map fst results
-                 lastG = snd $ last results
-            in (vals, lastG)
-
-withRandGen :: (ST.MonadState Game m) => (a -> StdGen -> (b, StdGen)) -> a -> m b
-withRandGen f a =
-    do  gen <- ST.gets getRandGen
-        let (result, newG) = f a gen
-        ST.modify (\game -> game { getRandGen = newG })
-        return result
 
 
 attack :: (ST.MonadState Game m, MonadIO m) => m ()
@@ -244,6 +239,7 @@ attack =
                                 ST.liftIO $ print stats
                                 attack
 
+-- Fortify
 
 fortify :: (ST.MonadState Game m, MonadIO m) => m ()
 fortify = 
@@ -290,13 +286,6 @@ parseFortifyCmd cmd =
         when (pcs > pieceCount sTerr - 1) $ throwError $ ValueError $ "You don't have " ++ show pcs ++ " many pieces at source territory: " ++ territoryName sTerr ++ "."
         when (pcs <= 0) $ throwError $ ValueError "You can't move a negative number of pieces."
         return (sTerr, dTerr, pcs)
-
-movePieces :: (ST.MonadState Game m) => Territory -> Territory -> PieceCount -> m ()
-movePieces sTerr dTerr pcs =
-    do  let newSTerr = sTerr { pieceCount = pieceCount sTerr - pcs }
-            newDTerr = dTerr { pieceCount = pieceCount dTerr + pcs }
-        replaceTerrST newSTerr
-        replaceTerrST newDTerr
 
 -- Board Build Functions
 
@@ -380,6 +369,24 @@ isOwner terr = do   player <- getCurrentPlayerST
 
 getPlayerTerrs :: (ST.MonadState Game m) => Player -> m [Territory]
 getPlayerTerrs plyr = ST.gets (filter (\t -> fromMaybe "" (owner t) == playerName plyr) . territories . getBoard)
+
+rolls :: RandomGen g => Int -> g -> ([Word], g)
+rolls n g =  let results = take n $ drop 1 $ iterate (\(_, gg) -> uniformR (1, 6) gg) (0, g)
+                 vals = map fst results
+                 lastG = snd $ last results
+            in (vals, lastG)
+
+withRandGen :: (ST.MonadState Game m) => (a -> StdGen -> (b, StdGen)) -> a -> m b
+withRandGen f a =
+    do  gen <- ST.gets getRandGen
+        let (result, newG) = f a gen
+        ST.modify (\game -> game { getRandGen = newG })
+        return result
+
+movePieces :: (ST.MonadState Game m) => Territory -> Territory -> PieceCount -> m ()
+movePieces sTerr dTerr pcs =
+    do  replaceTerrST sTerr { pieceCount = pieceCount sTerr - pcs }
+        replaceTerrST dTerr { pieceCount = pieceCount dTerr + pcs }
 
 -- Stats Functions
 
