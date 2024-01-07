@@ -21,48 +21,19 @@ import Data.Ord
 import Control.Lens
 import Control.Exception hiding (TypeError)
 
+import Utility
+import Board
+import Player
+import GameUtils
+import Game
 
 -- Type Aliases
 
-type TerritoryName = String
-type ContinentName = String
-type Bonus = Int
-type PlayerName = String
-type PieceCount = Int
+
+
+
 
 -- ADTs
-
-data Territory = Territory { territoryName :: TerritoryName
-                           , connections :: [TerritoryName]
-                           , continent :: ContinentName
-                           , initPieces :: PieceCount
-                           , owner :: Maybe PlayerName
-                           , pieceCount :: PieceCount } deriving (Eq)
-
-instance Show Territory where
-    show t = territoryName t ++ ", " ++ show (pieceCount t)
-
-data Continent = Continent { continentName :: ContinentName
-                           , bonus :: Bonus } deriving Show
-
-data Board = Board { _territories :: [Territory]
-                   , continents :: [Continent]} deriving Show
-
-territories :: Lens' Board [Territory]
-territories = lens _territories (\p newTerritories -> p { _territories = newTerritories })
-
-data BoardError = NoSuchContinent ContinentName
-                | NoSuchTerritory TerritoryName
-                | ArityError String
-                | TypeError String
-                | ValueError String
-
-instance Show BoardError where
-    show (NoSuchContinent cn) = "No such continent: " ++ cn ++ "."
-    show (NoSuchTerritory tn) = "No such territory: " ++ tn ++ "."
-    show (ArityError e) = "Arity Error: " ++ e ++ "."
-    show (TypeError e) = "Type Error: " ++ e ++ "."
-    show (ValueError e) = "Type Error: " ++ e ++ "."
 
 data OperationCodes = NoOp
                     | CancelOp String
@@ -70,57 +41,6 @@ data OperationCodes = NoOp
 instance Show OperationCodes where
     show NoOp = "No operation done."
     show (CancelOp e) = "Cancelled operation due to: " ++ e ++ "."
-
-data Card = Horse
-          | Soldier
-          | Cannon
-          | Wildcard deriving (Eq)
-
-data Player = HumanPlayer { playerName :: PlayerName
-                          , unitDeployment :: PieceCount
-                          , bonusCards :: [Card] } deriving (Eq)
-
--- Game State Monad
--- newtype Game = Game { getGame :: (Board, [Player], StdGen) }
-data Game = Game { _board :: Board 
-                 , _players :: [Player]
-                 , getRandGen :: StdGen }
-
-board :: Lens' Game Board
-board = lens _board (\p newBoard -> p { _board = newBoard })
-
-players :: Lens' Game [Player]
-players = lens _players (\p newPlayers -> p { _players = newPlayers })
-
-type MsgLog = [String]
-type CmdLog = [Command]
-
-type Logs = (MsgLog, CmdLog)
-
-tellMsg :: (MonadWriter Logs m) => MsgLog -> m ()
-tellMsg xs = tell (xs, mempty)
-
-tellCmd :: (MonadWriter Logs m) => CmdLog -> m ()
-tellCmd xs = tell (mempty, xs)
-
--- type Logs m =  (MonadWriter MsgLog m, MonadWriter CmdLog m)
-
--- newtype GameOp a = GameOp { runGame :: ST.StateT Game IO a }
-type GameOp a = ST.StateT Game IO a
-
-
-data Command    = SetupCmd Player Territory
-                | DeployCmd Territory PieceCount
-                | AttackCmd Territory Territory PieceCount
-                | FortifyCmd Territory Territory PieceCount
-                | SurrenderCmd Player
-
-instance Show Command where
-    show (SetupCmd plyr terr) = playerName plyr ++ " chooses " ++ territoryName terr ++ "."
-    show (DeployCmd terr pc) = "Player deploys " ++ show pc ++ " pieces to " ++ territoryName terr ++ "."
-    show (AttackCmd sTerr dTerr pc) = "Player attacks from " ++ territoryName sTerr ++ " to " ++ territoryName dTerr ++ " with " ++ show pc ++ " pieces."
-    show (FortifyCmd sTerr dTerr pc) = "Player moves " ++ show pc ++ " pieces from " ++ territoryName sTerr ++ " to " ++ territoryName dTerr ++ "."
-    show (SurrenderCmd plyr) = playerName plyr ++ "surrenders."
 
 -- Game Functions
 
@@ -166,7 +86,7 @@ getSetupCmd =
        terrChoiceResult <- runExceptT playerPrompt
        case terrChoiceResult of
             Left NoOp -> getSetupCmd
-            Left (CancelOp e) -> error "If you're going to cancel during setup. I might as well just blow up the game. Please try again."
+            Left (CancelOp _) -> error "If you're going to cancel during setup. I might as well just blow up the game. Please try again."
             Right terrChoice -> case getTerr brd terrChoice of
                                     Left e -> do ST.liftIO $ putStrLn $ show e ++ " Please try again."
                                                  getSetupCmd
@@ -408,108 +328,7 @@ parseFortifyCmd cmd =
         when (pcs <= 0) $ throwError $ ValueError "You can't move a negative number of pieces."
         return (FortifyCmd sTerr dTerr pcs)
 
--- Board Build Functions
 
-insertTerritory :: Board -> TerritoryName -> ContinentName -> PieceCount -> Either BoardError Board
-insertTerritory brd@(Board terrs conts) newTName contName initPieces = do
-        _ <- getCont brd contName -- Just to ensure that the continent exists
-        ( let newTerritory = Territory newTName [] contName initPieces Nothing initPieces
-          in Right $ Board (newTerritory : terrs) conts )
-
-insertTerritories :: Board -> [(TerritoryName, ContinentName, PieceCount)] -> Either BoardError Board
-insertTerritories = foldM (\b (tn, cn, ip) -> insertTerritory b tn cn ip)
-
-addConnection :: Board -> TerritoryName -> TerritoryName -> Either BoardError Board
-addConnection brd baseTName otherTName =
-    do (Territory _ baseConns baseCont baseIp baseOwn basePc) <- getTerr brd baseTName
-       (Territory _ otherConns otherCont otherIp otherOwn otherPc) <- getTerr brd otherTName
-       (let newBase = Territory baseTName (nub $ otherTName : baseConns) baseCont baseIp baseOwn basePc
-            newOther = Territory otherTName (nub $ baseTName : otherConns) otherCont otherIp otherOwn otherPc
-        in foldM replaceTerr brd [newBase, newOther])
-
-replaceTerr :: Board -> Territory -> Either BoardError Board
-replaceTerr (Board terrs conts) newT = 
-    fromMaybe (Left $ NoSuchTerritory tName)
-              $ do idx <- elemIndex tName $ map territoryName terrs
-                   newTerrs <- replaceElemAt terrs idx newT
-                   Just $ Right (Board newTerrs conts)
-    where tName = territoryName newT
-
-addConnections :: Board -> [(TerritoryName, TerritoryName)] -> Either BoardError Board
-addConnections = foldM (\b (bn, onn) -> addConnection b bn onn)
-
-bulkAdd :: Maybe Board -> [(ContinentName, Bonus)] -> [(TerritoryName, [TerritoryName], ContinentName, PieceCount)] -> Either BoardError Board
-bulkAdd maybeBoard contInfos terrInfos = 
-    do withTerrs <- insertTerritories withConts [(tName, cName, initPieces) | (tName, _, cName, initPieces) <- terrInfos]
-       connInfos <- Right $ flatten [[(tName, otherName) | otherName <- otherNames] | (tName, otherNames, _, _) <- terrInfos]
-       addConnections withTerrs connInfos
-    where (Board baseTerrs baseConts) = fromMaybe (Board [] []) maybeBoard
-          withConts = let newConts = map (uncurry Continent) contInfos
-                      in Board baseTerrs (newConts ++ baseConts)
-
--- Board Utility Functions
-
-getCont :: Board -> ContinentName -> Either BoardError Continent
-getCont board contName = case find ((contName ==) . continentName) $ continents board of
-    Just cont -> Right cont
-    Nothing -> Left $ NoSuchContinent contName
-    
-getTerr :: Board -> TerritoryName -> Either BoardError Territory
-getTerr board terrName = case board^.territories.to (find ((terrName ==) . territoryName)) of
-    Just terr -> Right terr
-    Nothing -> Left $ NoSuchTerritory terrName
-
-getTerrST :: (MonadError BoardError m, ST.MonadState Game m) => TerritoryName -> m Territory
-getTerrST terrName = do terrs <- use $ board.territories
-                        case find ((terrName ==) . territoryName) terrs of
-                            Just terr -> pure terr
-                            Nothing -> throwError $ NoSuchTerritory terrName
-
-readPieceCount :: (MonadError BoardError m, ST.MonadState Game m) => String -> m PieceCount
-readPieceCount pc = case readMaybe pc of
-                        (Just pcp) -> pure pcp
-                        Nothing -> throwError $ ValueError "Malformed piece count argument."
-
-terrsInCont :: Board -> ContinentName -> Either BoardError [Territory]
-terrsInCont board contName = if contName `elem` contNames
-    then Right $ board^.territories.to (filter ((contName ==) . continent))
-    else Left $ NoSuchContinent contName
-    where contNames = map continentName $ continents board
-
-rotatePlayers2 :: (ST.MonadState Game m, MonadWriter Logs m) => m ()
-rotatePlayers2 = do game <- ST.get
-                    let (firstPlayer:restPlayers) = game^.players
-                    players .= restPlayers ++ [firstPlayer]
-                    -- ST.put $ game {getPlayers = restPlayers ++ [firstPlayer]}
-                    tellMsg ["Next player's turn: " ++ playerName (head restPlayers) ++ "."]
-
-getCurrentPlayerST :: (ST.MonadState Game m) => m Player
-getCurrentPlayerST = use $ players.to head
-
-isOwner :: (MonadError BoardError m, ST.MonadState Game m) => Territory -> m Bool
-isOwner terr = do   player <- getCurrentPlayerST
-                    pure $ playerName player == fromMaybe "" (owner terr)
-
-getPlayerTerrs :: (ST.MonadState Game m) => Player -> m [Territory]
-getPlayerTerrs plyr = use $ board.territories.to (filter (\t -> fromMaybe "" (owner t) == playerName plyr))
-
-rolls :: RandomGen g => Int -> g -> ([Word], g)
-rolls n g =  let results = take n $ drop 1 $ iterate (\(_, gg) -> uniformR (1, 6) gg) (0, g)
-                 vals = map fst results
-                 lastG = snd $ last results
-            in (vals, lastG)
-
-withRandGen :: (ST.MonadState Game m) => (a -> StdGen -> (b, StdGen)) -> a -> m b
-withRandGen f a =
-    do  gen <- ST.gets getRandGen
-        let (result, newG) = f a gen
-        ST.modify (\game -> game { getRandGen = newG })
-        return result
-
-movePieces :: (ST.MonadState Game m) => Territory -> Territory -> PieceCount -> m ()
-movePieces sTerr dTerr pcs =
-    do  replaceTerrST sTerr { pieceCount = pieceCount sTerr - pcs }
-        replaceTerrST dTerr { pieceCount = pieceCount dTerr + pcs }
 
 -- Stats Functions
 
@@ -518,54 +337,6 @@ bonusPerTerr board contName = do
     terrs <- terrsInCont board contName
     cont <- getCont board contName
     return $ (fromIntegral $ bonus cont) / (fromIntegral $ length terrs)
-
--- Utility Functions
-
-liftMaybe :: (MonadPlus m) => Maybe a -> m a
-liftMaybe = maybe mzero return
-
-sortDesc :: (Ord a) => [a] -> [a]
-sortDesc = sortBy (flip compare)
-
-flatten :: [[a]] -> [a]
-flatten = foldr1 (++)
-
-replaceElemAt :: (Eq a) => [a] -> Int -> a -> Maybe [a]
-replaceElemAt lst idx newVal = if idx > length lst - 1 
-                               then Nothing
-                               else let (x, _:ys) = splitAt idx lst 
-                                    in Just (x ++ newVal : ys)
-
-eitherGuard :: a -> (a ->  Bool) -> e -> Either e a
-eitherGuard x p e = if p x then Right x else Left e
-
-maybeRight :: Either e a -> Maybe a
-maybeRight (Right x) = Just x
-maybeRight (Left _) = Nothing
-
-replaceOn :: (Functor f) => (a -> a -> Bool) -> a -> f a -> f a
-replaceOn p v = fmap (\x -> if p x v then v else x)
-
-whileM :: Monad m => (a -> Bool) -> (a -> m a) -> a -> m ()
-whileM test act init =
-   when (test init) $ act init >>= whileM test act
-
-replaceTerritory :: Territory -> GameOp ()
-replaceTerritory terr = do game <- ST.get
-                           let  terrs = game^.board.territories
-                                newTerrs = replaceOn ((==) `on` territoryName) terr terrs
-                           board.territories .= newTerrs
-                        --    ST.put $ game { getBoard =  board { territories = newTerrs }}
-                           return ()
-
-replaceTerrST :: (ST.MonadState Game m) => Territory -> m ()
-replaceTerrST terr =
-    do  game <- ST.get
-        let terrs = game^.board.territories
-            newTerrs = replaceOn ((==) `on` territoryName) terr terrs
-        board.territories .= newTerrs
-        -- ST.put $ game { board =  board { territories = newTerrs }}
-        return ()
 
 initialBoard = fromRight (Board [] []) $ bulkAdd Nothing
                                           [("Asia", 7), ("North America", 5), ("South America", 2)]
