@@ -67,6 +67,13 @@ executable Risk-Haskell
                    , Player
                    , GameUtils
                    , Game
+                   , Turn.Deploy
+                   , Turn.Attack
+                   , Turn.Fortify
+                   , Turn.Setup
+                   , Command.Op
+                   , Command.Prompt
+                   
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
